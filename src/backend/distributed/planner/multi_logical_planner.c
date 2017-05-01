@@ -132,8 +132,7 @@ static MultiNode * ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNo
  * Local functions forward declarations for subquery pushdown. Note that these
  * functions will be removed with upcoming subqery changes.
  */
-static Node * ReplaceExternParamsInOriginalQuery(Node *inputNode,
-												 ParamListInfo boundParams);
+static Node * ResolveExternalParams(Node *inputNode, ParamListInfo boundParams);
 static MultiNode * MultiSubqueryPlanTree(Query *originalQuery,
 										 Query *queryTree,
 										 PlannerRestrictionContext *
@@ -160,10 +159,6 @@ static MultiTable * MultiSubqueryPushdownTable(Query *subquery);
  * to this function. We need to do that since Citus currently unable to send
  * parameters to the workers on the execution.
  *
- * Note that although router planner uses original query, the above does not
- * apply given that we send the parameters to the workers explicitly on the
- * execution.
- *
  * We also pass queryTree and plannerRestrictionContext to the planner. They
  * are primarily used to decide whether the subquery is safe to pushdown.
  * If not, it helps to produce meaningful error messages for subquery
@@ -189,12 +184,11 @@ MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 	 */
 	if (SubqueryEntryList(queryTree) != NIL || SublinkList(originalQuery) != NIL)
 	{
-		/* consider replacing external parameters only when boundParams exists */
+		/* consider resolving external parameters only when boundParams exists */
 		if (boundParams)
 		{
-			originalQuery =
-				(Query *) ReplaceExternParamsInOriginalQuery((Node *) originalQuery,
-															 boundParams);
+			originalQuery = (Query *) ResolveExternalParams((Node *) originalQuery,
+															boundParams);
 		}
 
 		multiQueryNode = MultiSubqueryPlanTree(originalQuery, queryTree,
@@ -214,17 +208,15 @@ MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 
 
 /*
- * ReplaceExternParamsInOriginalQuery replaces the external parameters that appears
+ * ResolveExternalParams replaces the external parameters that appears
  * in the query with the corresponding entries in the boundParams.
  *
- * Note that this function is inspired by eval_const_expr() on Postgres. We cannot
- * use that function because it requires access to PlannerInfo.
+ * Note that this function is inspired by eval_const_expr() on Postgres.
+ * We cannot use that function because it requires access to PlannerInfo.
  */
 static Node *
-ReplaceExternParamsInOriginalQuery(Node *inputNode, ParamListInfo boundParams)
+ResolveExternalParams(Node *inputNode, ParamListInfo boundParams)
 {
-	int parameterIndex = 0;
-
 	Assert(boundParams != NULL);
 
 	if (inputNode == NULL)
@@ -235,13 +227,14 @@ ReplaceExternParamsInOriginalQuery(Node *inputNode, ParamListInfo boundParams)
 	if (IsA(inputNode, Param))
 	{
 		Param *paramToProcess = (Param *) inputNode;
-		ParamExternData correspondingParameterData;
+		ParamExternData *correspondingParameterData = NULL;
 		int numberOfParameters = boundParams->numParams;
 		int parameterId = paramToProcess->paramid;
 		int16 typeLength = 0;
 		bool typeByValue = false;
 		Datum constValue = 0;
 		bool paramIsNull = false;
+		int parameterIndex = 0;
 
 		if (paramToProcess->paramkind != PARAM_EXTERN)
 		{
@@ -260,27 +253,27 @@ ReplaceExternParamsInOriginalQuery(Node *inputNode, ParamListInfo boundParams)
 			return inputNode;
 		}
 
-		correspondingParameterData = boundParams->params[parameterIndex];
+		correspondingParameterData = &boundParams->params[parameterIndex];
 
-		if (!(correspondingParameterData.pflags & PARAM_FLAG_CONST))
+		if (!(correspondingParameterData->pflags & PARAM_FLAG_CONST))
 		{
 			return inputNode;
 		}
 
 		get_typlenbyval(paramToProcess->paramtype, &typeLength, &typeByValue);
 
-		paramIsNull = correspondingParameterData.isnull;
+		paramIsNull = correspondingParameterData->isnull;
 		if (paramIsNull)
 		{
 			constValue = 0;
 		}
 		else if (typeByValue)
 		{
-			constValue = correspondingParameterData.value;
+			constValue = correspondingParameterData->value;
 		}
 		else
 		{
-			constValue = datumCopy(correspondingParameterData.value, typeByValue,
+			constValue = datumCopy(correspondingParameterData->value, typeByValue,
 								   typeLength);
 		}
 
@@ -290,13 +283,11 @@ ReplaceExternParamsInOriginalQuery(Node *inputNode, ParamListInfo boundParams)
 	}
 	else if (IsA(inputNode, Query))
 	{
-		return (Node *) query_tree_mutator((Query *) inputNode,
-										   ReplaceExternParamsInOriginalQuery,
+		return (Node *) query_tree_mutator((Query *) inputNode, ResolveExternalParams,
 										   boundParams, 0);
 	}
 
-	return expression_tree_mutator(inputNode, ReplaceExternParamsInOriginalQuery,
-								   boundParams);
+	return expression_tree_mutator(inputNode, ResolveExternalParams, boundParams);
 }
 
 
